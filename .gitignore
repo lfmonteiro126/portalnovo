@@ -1,7 +1,24 @@
+# Python
 venv/
 __pycache__/
 *.pyc
-.env
+*.pyo
+.pytest_cache/
+
+# VS Code
+.vscode/
+
+# Secrets (MUITO IMPORTANTE!)
+.streamlit/secrets.toml
+
+# macOS
+.DS_Store
+
+# Logs e dados
 *.log
 data/*.csv
-.DS_Store
+data/*.evtx
+
+# Ambiente
+.env
+*.env

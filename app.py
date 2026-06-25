@@ -1,5 +1,44 @@
-import streamlit as st
+# ==========================================
+# 1. IMPORTS (SEMPRE NO TOPO)
+# ==========================================
+import streamlit as st  # ← DEVE SER A PRIMEIRA LINHA ÚTIL
 import pandas as pd
+from auth import check_password
+
+# ==========================================
+# 2. CONFIG DA PÁGINA
+# ==========================================
+st.set_page_config(
+    page_title="Event Portal Pro",
+    page_icon="🖥️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ==========================================
+# 3. AUTENTICAÇÃO (BLOQUEIA SE NÃO LOGADO)
+# ==========================================
+if not check_password():
+    st.stop()
+
+# No app.py, dentro da seção principal (após o login)
+with st.sidebar:
+    st.markdown("---")
+    
+    # Mostra usuário logado e botão de logout
+    if st.session_state.get("authenticated"):
+        st.caption(f"👤 **{st.session_state.user}**")
+        if st.button("🚪 Sair", use_container_width=True):
+            # Limpa toda a sessão
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()  # ← Aqui PODE usar st.rerun() porque não está em callback
+    
+    st.markdown("---")
+
+# ==========================================
+# 5. APP PRINCIPAL
+# ==========================================
 
 st.set_page_config(
     page_title="Event Portal Pro",
