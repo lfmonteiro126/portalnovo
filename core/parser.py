@@ -1,131 +1,159 @@
+"""
+Parser para logs do Event Viewer
+Versão conservadora: remove APENAS lixo óbvio
+"""
+
 import pandas as pd
-import re
-import xml.etree.ElementTree as ET
+import csv
 from io import StringIO
+import re
+import warnings
 
-def normalize_key(key):
-    if not key:
-        return ''
-    return re.sub(r'[^a-z0-9]', '', str(key).lower().encode('ascii', 'ignore').decode())
+warnings.filterwarnings('ignore')
 
-def extract_message(row):
-    """Extrai mensagem com fallback robusto"""
-    # Prioridade: __parsed_extra
-    if '__parsed_extra' in row:
-        extra = row['__parsed_extra']
-        if isinstance(extra, str) and len(extra) > 5 and extra != 'None':
-            return extra.strip()
-        if isinstance(extra, list):
-            joined = ' '.join(str(v) for v in extra if v and v != 'None')
-            if len(joined) > 5:
-                return joined.strip()
-    
-    # Aliases conhecidos
-    message_keys = ['message', 'mensagem', 'description', 'descricao', 'task category', 
-                    'categoria', 'details', 'detalhes']
-    
-    for key in message_keys:
-        for k, v in row.items():
-            if normalize_key(k) == normalize_key(key) and v and v != 'None' and len(str(v)) > 5:
-                return str(v).strip()
-    
-    # Fallback: maior string não-metadado
-    exclude = {'level', 'eventid', 'source', 'log', 'date', 'time', 'user', 'computer', 'task'}
-    candidates = [
-        (k, v) for k, v in row.items()
-        if v and isinstance(v, str) and len(v) > 5 and v != 'None'
-        and not any(e in normalize_key(k) for e in exclude)
-    ]
-    
-    if candidates:
-        candidates.sort(key=lambda x: len(x[1]), reverse=True)
-        return candidates[0][1].strip()
-    
-    return '(sem mensagem)'
 
-def smart_get(row, aliases):
-    """Busca inteligente em múltiplas variações"""
-    for alias in aliases:
-        for k, v in row.items():
-            if normalize_key(k) == normalize_key(alias) and v and v != 'None':
-                return v
-    return ''
+def parse_datetime_safe(value):
+    """Parser de datas simples"""
+    if not value or str(value).strip() in ['', 'None', '—', '-']:
+        return pd.NaT
+    
+    val = str(value).strip()
+    val = re.sub(r'[\u200e\u200f\u202a-\u202e]', '', val)
+    
+    try:
+        return pd.to_datetime(val, format='%m/%d/%Y %I:%M:%S %p')
+    except:
+        pass
+    
+    try:
+        return pd.to_datetime(val, errors='coerce')
+    except:
+        return pd.NaT
 
-def parse_csv(uploaded_file):
-    """Parser CSV robusto"""
-    content = uploaded_file.read().decode('utf-8-sig')
-    lines = content.split('\n')
-    
-    # Detecta cabeçalho
-    header_line = 0
-    for i, line in enumerate(lines[:10]):
-        if not line.strip():
-            continue
-        normalized = normalize_key(line)
-        has_keywords = any(kw in normalized for kw in ['nivel', 'level', 'data', 'date', 'source', 'event'])
-        comma_count = line.count(',')
-        if has_keywords and comma_count >= 3:
-            header_line = i
-            break
-    
-    clean_content = '\n'.join(lines[header_line:])
-    df = pd.read_csv(StringIO(clean_content), dtype=str, keep_default_na=False)
-    
-    processed = []
-    for _, row in df.iterrows():
-        row_dict = row.to_dict()
-        processed.append({
-            'TimeCreated': smart_get(row_dict, ['date and time', 'timecreated', 'data/hora', 'date', 'data']),
-            'Level': smart_get(row_dict, ['level', 'leveldisplayname', 'nivel']) or 'Information',
-            'EventId': int(smart_get(row_dict, ['event id', 'eventid', 'id']) or 0),
-            'Source': smart_get(row_dict, ['source', 'origem', 'provider']) or '',
-            'LogName': smart_get(row_dict, ['log name', 'log', 'canal']) or uploaded_file.name,
-            'Message': extract_message(row_dict)
-        })
-    
-    result_df = pd.DataFrame(processed)
-    result_df['TimeCreated'] = pd.to_datetime(result_df['TimeCreated'], errors='coerce')
-    return result_df
 
-def parse_xml(uploaded_file):
-    """Parser XML do Event Viewer"""
-    content = uploaded_file.read().decode('utf-8-sig')
-    root = ET.fromstring(content)
+def is_definitely_junk(source, message):
+    """
+    Remove APENAS lixo óbvio. Conservador ao máximo.
+    Retorna True apenas se for CERTAMENTE lixo.
+    """
+    if not message:
+        return False
     
-    events = []
-    for event in root.findall('.//Event'):
-        system = event.find('System')
-        if system is None:
-            continue
-        
-        time_created = system.find('TimeCreated')
-        level = system.find('Level')
-        event_id = system.find('EventID')
-        provider = system.find('Provider')
-        channel = system.find('Channel')
-        
-        level_map = {1: 'Critical', 2: 'Error', 3: 'Warning', 4: 'Information', 5: 'Verbose'}
-        level_num = int(level.text) if level is not None and level.text else 4
-        
-        events.append({
-            'TimeCreated': time_created.get('SystemTime', '').split('.')[0] if time_created is not None else '',
-            'Level': level_map.get(level_num, 'Information'),
-            'EventId': int(event_id.text) if event_id is not None and event_id.text else 0,
-            'Source': provider.get('Name', '') if provider is not None else '',
-            'LogName': channel.text if channel is not None else uploaded_file.name,
-            'Message': '(XML - detalhes disponíveis)'
-        })
+    # ÚNICO filtro: ESENT com "Internal Timing Sequence"
+    # Esses são logs de performance interna do banco ESE, inúteis para troubleshooting
+    if source and source.upper() == 'ESENT':
+        if 'Internal Timing Sequence' in message:
+            return True
     
-    result_df = pd.DataFrame(events)
-    result_df['TimeCreated'] = pd.to_datetime(result_df['TimeCreated'], errors='coerce')
-    return result_df
+    # Nada mais é filtrado!
+    # Eventos SPP com [(?)(?)(?)] são VÁLIDOS (status de licenciamento)
+    # Crash dumps do WER são VÁLIDOS (informações de erro)
+    # Eventos com data e Event ID são VÁLIDOS
+    
+    return False
+
 
 def parse_logs(uploaded_file):
-    """Parser principal"""
-    filename = uploaded_file.name.lower()
-    if filename.endswith('.csv'):
-        return parse_csv(uploaded_file)
-    elif filename.endswith('.xml'):
-        return parse_xml(uploaded_file)
-    else:
-        raise ValueError(f"Formato não suportado: {filename}")
+    """
+    Parser conservador para CSV do Event Viewer.
+    Formato: Level,DateTime,Source,EventID,TaskCategory,Message
+    """
+    try:
+        content_bytes = uploaded_file.read()
+        content = content_bytes.decode('utf-8-sig')
+        
+        print(f"\n🔍 Processando: {uploaded_file.name}")
+        print(f"📄 Tamanho: {len(content):,} caracteres")
+        
+        reader = csv.reader(StringIO(content))
+        rows = list(reader)
+        
+        if len(rows) < 2:
+            raise ValueError("CSV vazio ou só com cabeçalho")
+        
+        header = rows[0]
+        data_rows = rows[1:]
+        
+        print(f"📋 Cabeçalho: {header}")
+        print(f"📊 Linhas de dados: {len(data_rows)}")
+        
+        events = []
+        filtered_junk = 0
+        
+        for idx, row in enumerate(data_rows):
+            if len(row) < 5:
+                filtered_junk += 1
+                continue
+            
+            level = row[0].strip()
+            datetime_str = row[1].strip()
+            source = row[2].strip()
+            event_id_str = row[3].strip()
+            task_category = row[4].strip() if len(row) > 4 else ''
+            message = row[5].strip() if len(row) > 5 else ''
+            
+            if not level or not datetime_str:
+                filtered_junk += 1
+                continue
+            
+            parsed_time = parse_datetime_safe(datetime_str)
+            
+            if pd.isna(parsed_time):
+                filtered_junk += 1
+                continue
+            
+            try:
+                event_id = int(event_id_str) if event_id_str.isdigit() else 0
+            except:
+                event_id = 0
+            
+            # FILTRO CONSERVADOR: só remove lixo óbvio
+            if is_definitely_junk(source, message):
+                filtered_junk += 1
+                if filtered_junk <= 3:
+                    print(f"  🗑️ Filtrado: {source} (ID:{event_id}) - ESENT timing")
+                continue
+            
+            # Debug primeiras 3 linhas válidas
+            if len(events) < 3:
+                print(f"\n  ✅ [{idx}] Level: {level}")
+                print(f"       Time: {parsed_time}")
+                print(f"       Source: {source}")
+                print(f"       ID: {event_id}")
+                print(f"       Message: {message[:80]}...")
+            
+            events.append({
+                'TimeCreated': parsed_time,
+                'Level': level,
+                'EventId': event_id,
+                'Source': source if source else uploaded_file.name,
+                'LogName': uploaded_file.name,
+                'Message': message if message else '(sem mensagem)'
+            })
+        
+        if not events:
+            raise ValueError(f"Nenhum evento válido de {len(data_rows)} linhas")
+        
+        df = pd.DataFrame(events)
+        
+        total = len(df)
+        valid_dates = df['TimeCreated'].notna().sum()
+        valid_ids = (df['EventId'] > 0).sum()
+        
+        print(f"\n✅ RESULTADO:")
+        print(f"   📊 Eventos válidos: {total}")
+        print(f"   📅 Com data: {valid_dates}/{total}")
+        print(f"   🎯 Com ID: {valid_ids}/{total}")
+        print(f"   🗑️ Lixo filtrado: {filtered_junk}")
+        
+        df = df.sort_values('TimeCreated', ascending=False, na_position='last')
+        
+        return df
+        
+    except Exception as e:
+        print(f"❌ Erro: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame(columns=[
+            'TimeCreated', 'Level', 'EventId', 'Source', 'LogName', 'Message'
+        ])
